@@ -31,6 +31,57 @@
   </section>
 
   <section class="card">
+    <h2>上传站点日完整清单</h2>
+    <p class="hint">
+      清单表头：<code>事件号, 修订号</code>（英文 <code>event_no, revision</code> 亦可）。
+      清单代表该站点该 UTC 日的<b>全部</b>刷卡事件；同一站点日再次上传会<b>替换</b>旧清单并立即撤回旧核收结论。
+    </p>
+    <form id="manifest-form">
+      <input type="text" id="manifest-station" name="station" placeholder="站点（如 西直门）" required>
+      <input type="date" id="manifest-date" name="date" required>
+      <input type="file" id="manifest-file" name="file" accept=".csv,text/csv" required>
+      <button type="submit" id="manifest-btn">上传清单并核收</button>
+    </form>
+    <div id="manifest-result" class="result" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>站点日核收</h2>
+    <p class="hint">
+      仅当清单、已受理刷卡、修订号三者完全一致时显示<b>核齐</b>；没有清单的站点日永不判为核齐。
+      待核期间重核失败或服务重启后，旧结论不会恢复。
+    </p>
+    <div class="stat-row" id="recon-summary"></div>
+    <table class="grid" id="recon-table">
+      <thead>
+        <tr>
+          <th>站点</th><th>UTC 日</th><th>状态</th><th>清单</th>
+          <th class="num">缺失</th><th class="num">修订不符</th><th class="num">清单外</th>
+          <th>核收时间 (UTC)</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="recon-body">
+      {% for r in recon %}
+        <tr class="recon-row" data-station="{{ r.station }}" data-date="{{ r.date }}">
+          <td>{{ r.station }}</td>
+          <td class="mono">{{ r.date }}</td>
+          <td><span class="badge {{ r.status }}">{{ status_label(r.status) }}</span></td>
+          <td class="small">{{ r.manifest_filename or '—' }}{% if r.manifest_rows is not none %}（{{ r.manifest_rows }} 行）{% endif %}</td>
+          <td class="num">{{ r.missing if r.missing is not none else '—' }}</td>
+          <td class="num">{{ r.revision_mismatch if r.revision_mismatch is not none else '—' }}</td>
+          <td class="num">{{ r.unexpected if r.unexpected is not none else '—' }}</td>
+          <td class="mono small">{{ r.checked_at or (r.last_error or '') }}</td>
+          <td><button class="ghost-btn recon-open" data-station="{{ r.station }}" data-date="{{ r.date }}">明细</button></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="9" class="empty">尚无清单或刷卡数据</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div id="recon-panel" class="day-panel" hidden></div>
+  </section>
+
+  <section class="card">
     <h2>按日查看</h2>
     <div class="day-tabs" id="day-tabs">
       {% for d in days %}

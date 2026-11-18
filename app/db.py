@@ -16,6 +16,16 @@ Model
   stops a slow recompute from publishing over newer data.
 * ``recompute_jobs`` – durable outbox.  Uploads only enqueue; only a
   successfully committed computation flips day states to ``current``.
+* ``manifests`` / ``manifest_entries`` – upstream "complete list" per
+  station and UTC day.  Only one manifest per station-day is ``active``;
+  replacing it supersedes the old row but keeps it for audit.
+* ``recon_state`` – reconciliation conclusion per station-day.  A conclusion
+  is only trusted while ``data_epoch`` matches ``recon_epochs``.  Withdrawing
+  it (new manifest, changed tap) clears the stored diff immediately.
+* ``recon_diffs`` – missing / revision-mismatch / out-of-manifest rows of the
+  latest completed check.
+* ``recon_epochs`` / ``recon_jobs`` – the same fencing-token and durable
+  outbox pattern as the ridership recompute, per station-day.
 """
 
 from __future__ import annotations
@@ -112,6 +122,80 @@ CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------------------
+-- manifest reconciliation (station-day completeness check)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS manifests (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    station       TEXT    NOT NULL,
+    service_date  TEXT    NOT NULL,
+    filename      TEXT    NOT NULL,
+    uploaded_at   TEXT    NOT NULL,
+    row_count     INTEGER NOT NULL DEFAULT 0,
+    superseded_at TEXT,
+    is_active     INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+);
+-- At most one active manifest per station-day.  Replacing deactivates the old
+-- row in the same transaction, so this index also fences concurrent uploads.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_manifests_active
+    ON manifests (station, service_date) WHERE is_active = 1;
+CREATE INDEX IF NOT EXISTS idx_manifests_day ON manifests (service_date, station);
+
+CREATE TABLE IF NOT EXISTS manifest_entries (
+    manifest_id  INTEGER NOT NULL REFERENCES manifests(id) ON DELETE CASCADE,
+    event_no     TEXT    NOT NULL,
+    revision     INTEGER NOT NULL,
+    PRIMARY KEY (manifest_id, event_no)
+);
+
+CREATE TABLE IF NOT EXISTS recon_state (
+    station       TEXT    NOT NULL,
+    service_date  TEXT    NOT NULL,
+    status        TEXT    NOT NULL CHECK (status IN ('pending', 'complete', 'mismatch', 'failed')),
+    manifest_id   INTEGER REFERENCES manifests(id),
+    data_epoch    INTEGER NOT NULL DEFAULT 0,
+    checked_at    TEXT,
+    last_error    TEXT,
+    updated_at    TEXT    NOT NULL,
+    PRIMARY KEY (station, service_date)
+);
+
+CREATE TABLE IF NOT EXISTS recon_diffs (
+    station         TEXT    NOT NULL,
+    service_date    TEXT    NOT NULL,
+    kind            TEXT    NOT NULL CHECK (kind IN ('missing', 'revision', 'unexpected')),
+    event_no        TEXT    NOT NULL,
+    accepted_rev    INTEGER,
+    manifest_rev    INTEGER,
+    accepted_station TEXT,
+    detail          TEXT,
+    PRIMARY KEY (station, service_date, kind, event_no)
+);
+CREATE INDEX IF NOT EXISTS idx_recon_diffs_day ON recon_diffs (service_date, station);
+
+CREATE TABLE IF NOT EXISTS recon_epochs (
+    station      TEXT NOT NULL,
+    service_date TEXT NOT NULL,
+    epoch        INTEGER NOT NULL,
+    PRIMARY KEY (station, service_date)
+);
+
+CREATE TABLE IF NOT EXISTS recon_jobs (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at       TEXT    NOT NULL,
+    started_at       TEXT,
+    finished_at      TEXT,
+    status           TEXT    NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed')),
+    station          TEXT    NOT NULL,
+    service_date     TEXT    NOT NULL,
+    trigger_manifest_id INTEGER REFERENCES manifests(id),
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recon_jobs_status ON recon_jobs (status, id);
+CREATE INDEX IF NOT EXISTS idx_recon_jobs_pair ON recon_jobs (station, service_date, status);
 """
 
 

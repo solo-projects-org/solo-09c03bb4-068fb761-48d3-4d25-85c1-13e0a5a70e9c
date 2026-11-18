@@ -33,7 +33,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
-from . import db
+from . import db, reconcile
 from .ingest import Tap, UploadError, parse_csv
 from .journeys import Event, Journey, PendingTap, derive
 
@@ -147,6 +147,7 @@ class AcceptResult:
     ignored: int
     affected_days: list[str]
     job_id: int
+    recon_pairs: list[tuple[str, str]]
 
 
 def accept_upload(db_path: str | Path, filename: str, payload: bytes) -> AcceptResult:
@@ -186,6 +187,19 @@ def _accept(conn: sqlite3.Connection, filename: str, taps: list[Tap]) -> AcceptR
     batch_id = int(cursor.lastrowid)
 
     max_rev = _latest_revisions(conn, event_nos)
+    # Previous winning revision per event, so a correction that moves a tap to
+    # another station or UTC day withdraws the *old* station-day as well.
+    prior_winners: dict[str, sqlite3.Row] = {}
+    for i in range(0, len(event_nos), 500):
+        part = event_nos[i:i + 500]
+        for row in conn.execute(
+            "SELECT e.event_no, e.station, e.tap_time, e.revision FROM events e "
+            "JOIN (SELECT event_no, MAX(revision) AS rev FROM events GROUP BY event_no) m "
+            "ON m.event_no = e.event_no AND m.rev = e.revision "
+            "WHERE e.event_no IN (%s)" % ",".join("?" for _ in part),
+            part,
+        ):
+            prior_winners[row["event_no"]] = row
     # Only the highest revision per event inside this file matters; lower ones
     # are superseded by their own file and reported as ignored.
     file_best: dict[str, int] = {}
@@ -194,6 +208,7 @@ def _accept(conn: sqlite3.Connection, filename: str, taps: list[Tap]) -> AcceptR
 
     inserted = 0
     ignored = 0
+    recon_pairs: set[tuple[str, str]] = set()
     for tap in taps:
         if tap.revision != file_best[tap.event_no]:
             ignored += 1
@@ -223,6 +238,16 @@ def _accept(conn: sqlite3.Connection, filename: str, taps: list[Tap]) -> AcceptR
             (batch_id, tap.event_no, tap.card_id, tap.iso, tap.station, tap.direction, tap.revision, now),
         )
         inserted += 1
+        # A new revision changes the winning revision for this event.  Its new
+        # station-day must be re-checked against the manifest; if the tap moved
+        # station or date, the previous station-day loses it and is re-checked
+        # too.  Both withdrawals happen inside this acceptance transaction.
+        recon_pairs.add((tap.station, tap.day))
+        prior = prior_winners.get(tap.event_no)
+        if prior is not None:
+            prior_pair = (prior["station"], prior["tap_time"][:10])
+            if prior_pair != (tap.station, tap.day):
+                recon_pairs.add(prior_pair)
 
     conn.execute(
         "UPDATE batches SET accepted_count = ?, ignored_count = ? WHERE id = ?",
@@ -247,6 +272,14 @@ def _accept(conn: sqlite3.Connection, filename: str, taps: list[Tap]) -> AcceptR
     else:
         job_id = 0
 
+    # Reconciliation is invalidated in the same transaction that accepted the
+    # revisions: the stored diff is deleted and the state becomes pending, so
+    # the old "核齐" conclusion cannot be observed after this commit.
+    if recon_pairs:
+        reconcile.withdraw_pairs(
+            conn, recon_pairs, f"批次 {batch_id} 受理新修订，核收结论撤回"
+        )
+
     return AcceptResult(
         batch_id=batch_id,
         row_count=len(taps),
@@ -254,6 +287,7 @@ def _accept(conn: sqlite3.Connection, filename: str, taps: list[Tap]) -> AcceptR
         ignored=ignored,
         affected_days=sorted(affected) if inserted else [],
         job_id=job_id,
+        recon_pairs=sorted(recon_pairs),
     )
 
 

@@ -93,3 +93,116 @@ def test_cross_midnight_correction_via_api(client):
     assert day1["status"] == day2["status"] == "current"
     assert [(p["from_station"], p["to_station"]) for p in day1["station_pairs"]] == [("A", "D")]
     assert day2["trip_total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# manifest reconciliation endpoints
+# ---------------------------------------------------------------------------
+
+def manifest_bytes(rows):
+    return ("事件号,修订号\n" + "".join(f"{e},{r}\n" for e, r in rows)).encode("utf-8")
+
+
+def post_manifest(client, station, day, rows, name="manifest.csv"):
+    return client.post(
+        "/api/manifests",
+        data={"station": station, "date": day},
+        files={"file": (name, manifest_bytes(rows), "text/csv")},
+    )
+
+
+def test_manifest_upload_complete_and_mismatch(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "西直门", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "国贸", "out"),
+    ])
+    res = post_manifest(client, "西直门", "2024-05-01", [["e1", 0]])
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["reconciliation"]["status"] == "complete"
+    assert body["reconciliation"]["counts"] == {"missing": 0, "revision": 0, "unexpected": 0}
+
+    res = post_manifest(client, "西直门", "2024-05-01", [["e1", 2], ["e8", 0]])
+    assert res.status_code == 200
+    rec = res.json()["reconciliation"]
+    assert rec["status"] == "mismatch"
+    assert rec["counts"] == {"missing": 1, "revision": 1, "unexpected": 0}
+    assert res.json()["replaced_manifest_id"] is not None
+
+    listing = client.get("/api/recon").json()
+    row = next(r for r in listing["reconciliation"]
+               if (r["station"], r["date"]) == ("西直门", "2024-05-01"))
+    assert row["status"] == "mismatch"
+    assert row["missing"] == 1 and row["revision_mismatch"] == 1
+    assert listing["summary"]["mismatch"] >= 1
+
+
+def test_manifest_without_taps_reports_missing(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "西直门", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "国贸", "out"),
+    ])
+    body = post_manifest(client, "国贸", "2024-05-01", [["e2", 0], ["e7", 0]]).json()
+    assert body["reconciliation"]["status"] == "mismatch"
+    assert body["reconciliation"]["counts"]["missing"] == 1
+
+
+def test_station_day_without_manifest_is_not_complete(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "西直门", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "国贸", "out"),
+    ])
+    detail = client.get("/api/recon/国贸/2024-05-01").json()
+    assert detail["status"] == "no_manifest"
+    assert detail["checked"] is False
+    assert detail["diffs"] == []
+    # The station-day still appears in the list (so it cannot be overlooked).
+    rows = client.get("/api/recon").json()["reconciliation"]
+    assert ("国贸", "2024-05-01") in {(r["station"], r["date"]) for r in rows}
+
+
+def test_manifest_validation_errors(client):
+    assert post_manifest(client, "", "2024-05-01", [["e1", 0]]).status_code == 400
+    assert post_manifest(client, "西直门", "2024-13-01", [["e1", 0]]).status_code == 400
+    res = client.post(
+        "/api/manifests",
+        data={"station": "西直门", "date": "2024-05-01"},
+        files={"file": ("bad.csv", b"foo,bar\n1,2\n", "text/csv")},
+    )
+    assert res.status_code == 400
+    assert "表头" in res.json()["detail"]
+
+
+def test_recon_retry_without_manifest_is_400(client):
+    res = client.post("/api/recon/西直门/2024-05-01/retry")
+    assert res.status_code == 400
+
+
+def test_index_shows_reconciliation_section(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "西直门", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "国贸", "out"),
+    ])
+    post_manifest(client, "西直门", "2024-05-01", [["e1", 0]])
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "站点日核收" in page.text
+    assert "核齐" in page.text
+    assert "上传站点日完整清单" in page.text
+
+
+def test_correction_withdraws_conclusion_via_api(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "西直门", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "国贸", "out"),
+    ])
+    assert post_manifest(client, "西直门", "2024-05-01", [["e1", 0]]).json()[
+        "reconciliation"]["status"] == "complete"
+    # Move e1 to 国贸 with a higher revision: 西直门 loses it.
+    res = upload(client, [tap("e1", "c1", "2024-05-01T08:00:00Z", "国贸", "in", revision=1)])
+    assert res.status_code == 200
+    detail = client.get("/api/recon/西直门/2024-05-01").json()
+    assert detail["status"] == "mismatch"
+    assert detail["counts"]["missing"] == 1
+    guomao = client.get("/api/recon/国贸/2024-05-01").json()
+    assert guomao["status"] == "no_manifest"   # has taps, still not a conclusion
